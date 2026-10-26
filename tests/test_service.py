@@ -76,3 +76,23 @@ def test_ai_endpoint_without_api_key_returns_service_unavailable():
             os.environ["OPENROUTER_API_KEY"] = old_or
         if old_ai:
             os.environ["OPENAI_API_KEY"] = old_ai
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from app.main import get_next_friday
+
+
+def test_get_next_friday_calculation():
+    """Тест детермінованого розрахунку найближчої п'ятниці за CR-1."""
+    tz = ZoneInfo("Europe/Kyiv")
+    # Понеділок -> п'ятниця того ж тижня
+    monday = datetime(2026, 10, 12, 10, 0, tzinfo=tz)
+    assert get_next_friday(monday) == "2026-10-16"
+
+    # П'ятниця -> сьогодні
+    friday = datetime(2026, 10, 16, 15, 0, tzinfo=tz)
+    assert get_next_friday(friday) == "2026-10-16"
+
+    # Субота -> п'ятниця наступного тижня
+    saturday = datetime(2026, 10, 17, 12, 0, tzinfo=tz)
+    assert get_next_friday(saturday) == "2026-10-23"
