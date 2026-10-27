@@ -1,16 +1,18 @@
 [
   {
-    "id": "task-1-4725",
-    "title": "Підготувати ретроспективу",
-    "description": "Зібрати метрики спринту",
-    "assignee": "Ірина",
-    "due_date": "2026-10-14"
+    "id": "task-ai-1",
+    "title": "зробити звіт",
+    "description": null,
+    "assignee": "Віктор",
+    "due_date": "2026-12-31",
+    "inferred_due_date": false
   },
   {
-    "id": "task-2-2069",
-    "title": "Термінова перевірка після збою",
-    "description": null,
-    "assignee": "Максим",
-    "due_date": "2026-10-25"
+    "id": "task-ai-2",
+    "title": "підготувати звіт",
+    "description": "детально розписані фінансові показники",
+    "assignee": "Саші",
+    "due_date": "2026-11-30",
+    "inferred_due_date": false
   }
 ]

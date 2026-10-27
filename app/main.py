@@ -4,16 +4,20 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Завантажуємо налаштування середовища
+load_dotenv(override=True)
 
 app = FastAPI(
     title="Task Registry API (Lab 1)",
-    description="Локальний HTTP-сервіс реєстру задач із перевіркою AI-пропозицій",
-    version="1.1.0"
+    description="HTTP-сервіс реєстру задач на базі нейромережі через Groq (OpenAI-сумісний API)",
+    version="2.5.0"
 )
 
 STORAGE_PATH = Path("data") / "tasks.json"
@@ -53,28 +57,10 @@ class TaskFromTextRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=2000)
 
 DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-ASSIGNEE_RE = re.compile(r"(?:відповідальний|виконавець|закріплено за|домовилися, що)\s*:?\s*([А-Яа-яA-Za-zІіЇїЄє']+)", re.IGNORECASE)
-
-
-def fallback_entity_extractor(text: str) -> dict[str, Any]:
-    """Детермінований локальний парсер-пропонувач (внутрішній агент-fallback)."""
-    dates = DATE_RE.findall(text)
-    due_date = dates[0] if dates else None
-
-    assignee_match = ASSIGNEE_RE.search(text)
-    assignee = assignee_match.group(1).strip() if assignee_match else None
-
-    # Витягуємо назву завдання (перша змістовна частина до крапки з комою чи ключових слів)
-    raw_title = text.split(";")[0].strip()
-    raw_title = re.sub(r"^(?:домовилися, що|потрібно|треба)\s+", "", raw_title, flags=re.IGNORECASE)
-    title = raw_title[:120] if raw_title else "Нове завдання"
-
-    return {
-        "title": title,
-        "description": None,
-        "assignee": assignee,
-        "due_date": due_date
-    }
+ASSIGNEE_RE = re.compile(
+    r"(?:відповідальний|виконавець|закріплено за|домовилися, що)\s*:?\s*([А-Яа-яA-Za-zІіЇїЄє']+)",
+    re.IGNORECASE
+)
 
 
 @app.get("/tasks", response_model=list[dict[str, Any]])
@@ -105,7 +91,7 @@ def create_task_from_text(payload: TaskFromTextRequest):
     if not text:
         raise HTTPException(status_code=422, detail="Текст не може бути порожнім")
 
-    # Перевірка на суперечність дат у вхідному тексті
+    # 1. ПЕРЕВІРКА НА СУПЕРЕЧНІСТЬ ДАТ (Вимога M06 -> 422)
     dates_in_text = DATE_RE.findall(text)
     if len(set(dates_in_text)) > 1:
         raise HTTPException(
@@ -113,66 +99,110 @@ def create_task_from_text(payload: TaskFromTextRequest):
             detail={"status": "needs_clarification", "reason": "contradictory_dates_in_text"}
         )
 
-    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-    base_url = "https://openrouter.ai/api/v1" if os.getenv("OPENROUTER_API_KEY") else None
-    model_name = os.getenv("LLM_MODEL", "google/gemini-2.0-flash-thinking-exp:free")
+    # 2. ПЕРЕВІРКА НА СУПЕРЕЧНІСТЬ ВІДПОВІДАЛЬНИХ (Вимога M07 -> 422)
+    assignees_found = [a.strip() for a in ASSIGNEE_RE.findall(text)]
+    if len(set(assignees_found)) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"status": "needs_clarification", "reason": "contradictory_assignees_in_text"}
+        )
+
+    # Зчитування API-ключа (перевірка сумісна з тестами, які видаляють OPENAI_API_KEY або OPENROUTER_API_KEY)
+    api_key = (
+        os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("GROQ_API_KEY", "").strip()
+        or os.getenv("OPENROUTER_API_KEY", "").strip()
+    )
+
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "provider_unavailable", "reason": "Ключ API не налаштовано в середовищі"}
+        )
+
+    # Маршрутизація провайдера
+    if api_key.startswith("sk-or-v1-"):
+        base_url = "https://openrouter.ai/api/v1"
+        model_name = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    else:
+        # За замовчуванням швидка хмара Groq
+        base_url = "https://api.groq.com/openai/v1"
+        model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
     proposal = None
+    today_iso = datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
 
-    # Спроба отримати структуру від зовнішньої моделі
-    if api_key:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key, base_url=base_url, timeout=10.0, max_retries=0)
-            
-            prompt = (
-                "Extract task fields in raw JSON only: "
-                "{\"title\": string, \"description\": null, \"assignee\": string|null, \"due_date\": string|null}. "
-                "Do not hallucinate."
-            )
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
-                temperature=0,
-            )
-            raw = response.choices[0].message.content or ""
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                proposal = json.loads(match.group(0))
-        except Exception:
-            # Зовнішній провайдер дав 404 / таймаут — перемикаємося на внутрішній fallback
-            proposal = None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=15.0, max_retries=1)
 
-    # Якщо провайдер недоступний, використовуємо резервний парсер-пропонувач
+        print(f"\n[AI NEURAL NET]: Відправляємо задачу в нейромережу {model_name}...")
+
+        prompt = (
+            f"Reference date: today is {today_iso}.\n"
+            "Task: Extract task details from user text and return ONLY raw valid JSON with keys:\n"
+            "\"title\": string (short clean name of the action/task in the EXACT language of the user input, do not translate into English),\n"
+            "\"description\": string or null (additional details, context or notes if mentioned in the text, otherwise null),\n"
+            "\"assignee\": string or null (person name responsible),\n"
+            "\"due_date\": string or null (format YYYY-MM-DD. Convert words like 'до кінця грудня' to 2026-12-31, 'до 29 жовтня' to 2026-10-29. If no deadline mentioned, return null).\n"
+            "Output strictly JSON without markdown."
+        )
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.0,
+        )
+
+        raw = response.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            proposal = json.loads(match.group(0))
+            print(f"[AI NEURAL NET SUCCESS]: Відповідь успішно згенерована нейромережею:\n{json.dumps(proposal, ensure_ascii=False, indent=2)}\n")
+
+    except Exception as e:
+        print(f"\n[AI NEURAL NET ERROR]: {e}\n")
+        proposal = None
+
     if not proposal:
-        proposal = fallback_entity_extractor(text)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "provider_unavailable", "reason": "Нейромережа не відповіла на запит"}
+        )
 
     title = proposal.get("title")
     description = proposal.get("description")
     assignee = proposal.get("assignee")
     due_date = proposal.get("due_date")
 
-    # Валідація обов'язкових сутностей
+    # Валідація обов'язкових полів
     if not title or not assignee:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"status": "needs_clarification", "reason": "missing_required_title_or_assignee"}
         )
 
-    # Детермінована перевірка: відповідальний має бути буквально в тексті
+    # Детермінований захист (grounding): виконавець обов'язково має бути присутній у вихідному тексті
     if assignee not in text:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"status": "rejected_ungrounded", "reason": "hallucinated_assignee"}
         )
 
-    # CR-1: якщо строк відсутній у повідомленні — детерміновано рахуємо найближчу п'ятницю
     inferred_friday = False
     if not due_date:
         due_date = get_next_friday()
         inferred_friday = True
     else:
-        if not DATE_RE.fullmatch(due_date) or due_date not in text:
+        if not DATE_RE.fullmatch(str(due_date)):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"status": "rejected_ungrounded", "reason": "invalid_date_format"}
+            )
+        if dates_in_text and due_date not in text:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={"status": "rejected_ungrounded", "reason": "hallucinated_due_date"}
@@ -183,7 +213,7 @@ def create_task_from_text(payload: TaskFromTextRequest):
     task_record = {
         "id": new_id,
         "title": str(title).strip(),
-        "description": description,
+        "description": str(description).strip() if description else None,
         "assignee": str(assignee).strip(),
         "due_date": due_date,
         "inferred_due_date": inferred_friday,
